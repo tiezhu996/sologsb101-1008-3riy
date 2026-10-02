@@ -7,14 +7,13 @@ import { defineStore } from 'pinia'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { db, type AdjustRow } from '@/utils/db'
 import {
-  ADJUST_STATE_FLOW,
   type Adjust,
   type AdjustDraft,
   type AdjustState
 } from '@/types/adjust'
+import type { Valve } from '@/types/valve'
 import { useValveStore } from '@/stores/valveStore'
 import { balanceLevel, imbalance, type BalanceLevel } from '@/utils/balance'
-import type { Valve } from '@/types/valve'
 
 export interface AdjustEnriched {
   adjust: Adjust
@@ -104,6 +103,7 @@ export const useAdjustStore = defineStore('adjust', () => {
   const hasAdjust = (valveId: string): boolean => adjusts.value.some((adjust) => adjust.valveId === valveId)
 
   async function createAdjust(draft: AdjustDraft): Promise<AdjustRow> {
+    const now = Date.now()
     return (await adjustTable.create(
       {
         valveId: draft.valveId,
@@ -111,7 +111,14 @@ export const useAdjustStore = defineStore('adjust', () => {
         basis: draft.basis.trim(),
         executor: draft.executor.trim() || '待指派',
         state: draft.state,
-        reviewNote: draft.reviewNote.trim()
+        reviewNote: draft.reviewNote.trim(),
+        batchId: '',
+        batchSeq: 0,
+        executedAt: 0,
+        executedShift: '',
+        executedOpening: null,
+        createdAt: now,
+        updatedAt: now
       },
       'aj'
     )) as AdjustRow
@@ -130,21 +137,16 @@ export const useAdjustStore = defineStore('adjust', () => {
     await adjustTable.remove(id)
   }
 
-  /** 状态流转：已调节时把目标开度回写到阀门 */
-  async function advance(id: string): Promise<AdjustState | null> {
-    const adjust = adjusts.value.find((item) => item.id === id)
-    if (!adjust) return null
-    const next = ADJUST_STATE_FLOW[adjust.state]
-    if (!next) return null
-    await adjustTable.update(id, { state: next })
-    if (next === '已调节') {
-      await valveStore.applyOpening(adjust.valveId, adjust.targetOpening)
-    }
-    return next
-  }
-
-  /** 复核：写复核意见并闭环 */
+  /**
+   * 复核闭环：已调节 → 已复核。
+   * 注意：待下发 → 已调节的执行动作不在此直接处理，统一由执行批次事务
+   * （utils/executionBatch.stepExecutionBatch）认领租约后逐张原子完成，
+   * 避免两个页面重复执行或执行记录与阀门开度不一致。
+   */
   async function review(id: string, note: string): Promise<void> {
+    const adjust = adjusts.value.find((item) => item.id === id)
+    if (!adjust) return
+    if (adjust.state === '待下发') return
     await adjustTable.update(id, { state: '已复核', reviewNote: note.trim() || '复核合格' })
   }
 
@@ -164,6 +166,11 @@ export const useAdjustStore = defineStore('adjust', () => {
         executor: '待指派',
         state: '待下发' as AdjustState,
         reviewNote: '',
+        batchId: '',
+        batchSeq: 0,
+        executedAt: 0,
+        executedShift: '',
+        executedOpening: null,
         createdAt: now,
         updatedAt: now
       }))
@@ -188,7 +195,6 @@ export const useAdjustStore = defineStore('adjust', () => {
     createAdjust,
     updateAdjust,
     removeAdjust,
-    advance,
     review,
     generateFromRank
   }

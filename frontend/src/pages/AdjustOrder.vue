@@ -1,28 +1,32 @@
 <script setup lang="ts">
 /**
  * /adjusts 调节单下发与复核
- * 生成目标开度、执行回填、复核确认并导出全量 JSON。
- * 消费 Adjust、Valve、Measure；复用 <FilterBar>、<EmptyPanel>、<StatBadge>、<BalanceTag>。
+ * 待下发单先认领进执行批次，页面拿到租约后逐张执行（执行记录与阀门开度同事务保存）；
+ * 已调节单在此复核闭环；支持按最终执行结果导出 CSV 与全量 JSON。
+ * 消费 Adjust、Valve、Measure、ExecutionBatch；复用 <FilterBar>、<EmptyPanel>、<StatBadge>、<BalanceTag>、<ExecutionPanel>。
  */
-import { computed, reactive, ref, watchEffect } from 'vue'
+import { computed, onMounted, reactive, ref, watchEffect } from 'vue'
 import { MessagePlugin, DialogPlugin } from 'tdesign-vue-next'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import BalanceTag from '@/components/common/BalanceTag.vue'
+import ExecutionPanel from '@/components/common/ExecutionPanel.vue'
 import { useAdjustStore, type AdjustEnriched } from '@/stores/adjustStore'
 import { useValveStore } from '@/stores/valveStore'
 import { useStationStore } from '@/stores/stationStore'
+import { useBatchStore } from '@/stores/batchStore'
 import { useImbalanceRank } from '@/hooks/useImbalanceRank'
 import {
   ADJUST_STATES,
-  ADJUST_STATE_FLOW,
   EMPTY_ADJUST_DRAFT,
+  effectiveExecutedOpening,
   type Adjust,
   type AdjustDraft,
   type AdjustState
 } from '@/types/adjust'
 import { basisText, formatOpening } from '@/utils/balance'
+import { formatDateTime } from '@/utils/datetime'
 import { exportAdjustCsv } from '@/utils/export'
 import {
   DB_VERSION,
@@ -42,6 +46,7 @@ type FilterModel = { keyword: string; [key: string]: string | string[] | boolean
 const adjustStore = useAdjustStore()
 const valveStore = useValveStore()
 const stationStore = useStationStore()
+const batchStore = useBatchStore()
 const rank = useImbalanceRank()
 
 // 把最新实测快照灌入调节单 store，用于重算失衡度
@@ -66,6 +71,16 @@ async function refreshCounts(): Promise<void> {
   counts.value = await countAll()
 }
 
+onMounted(() => {
+  // 旧调节单首次进入补成历史批次（导入旧存档等漏迁场景幂等兜底）
+  void (async () => {
+    const patched = await batchStore.ensureLegacy()
+    if (patched) await refreshCounts()
+    // 本页刷新前持约的批次：租约仍有效则续跑，已过期则从最后完成项自接管
+    await batchStore.resumeOnLoad()
+  })()
+})
+
 /* ------------------------------ 筛选 ------------------------------ */
 
 const filterModel = computed<FilterModel>(() => ({
@@ -84,17 +99,32 @@ function onFilterChange(model: FilterModel): void {
   })
 }
 
-const rows = computed(() => adjustStore.filtered)
+const rows = computed(() => {
+  const batchById = batchStore.batchById
+  const rankOf = (item: AdjustEnriched): number => {
+    const batch = batchById.get(item.adjust.batchId)
+    if (!batch) return Number.MAX_SAFE_INTEGER
+    return batch.kind === 'history' ? 0 : batch.claimedAt
+  }
+  return [...adjustStore.filtered].sort((a, b) => {
+    const rankDiff = rankOf(a) - rankOf(b)
+    if (rankDiff !== 0) return rankDiff
+    const seqDiff = a.adjust.batchSeq - b.adjust.batchSeq
+    if (seqDiff !== 0) return seqDiff
+    return a.adjust.createdAt - b.adjust.createdAt
+  })
+})
 
 const columns = [
   { colKey: 'valve', title: '阀门 / 楼栋', width: 200, cell: 'valveCell' },
   { colKey: 'imbalance', title: '失衡度', width: 150, cell: 'imbalanceCell' },
-  { colKey: 'opening', title: '当前 → 目标开度', width: 170, cell: 'openingCell' },
-  { colKey: 'basis', title: '调节依据', minWidth: 260, cell: 'basisCell' },
+  { colKey: 'opening', title: '台账开度 → 目标 / 最终执行', width: 220, cell: 'openingCell' },
+  { colKey: 'basis', title: '调节依据', minWidth: 240, cell: 'basisCell' },
   { colKey: 'executor', title: '执行人', width: 110 },
-  { colKey: 'state', title: '状态', width: 110, cell: 'stateCell' },
-  { colKey: 'note', title: '复核意见', width: 180, cell: 'noteCell' },
-  { colKey: 'op', title: '操作', width: 250, cell: 'opCell' }
+  { colKey: 'state', title: '状态 / 批次', width: 170, cell: 'stateCell' },
+  { colKey: 'exec', title: '执行记录', width: 170, cell: 'execCell' },
+  { colKey: 'note', title: '复核意见', width: 170, cell: 'noteCell' },
+  { colKey: 'op', title: '操作', width: 230, cell: 'opCell' }
 ]
 
 function rowKey(row: AdjustEnriched): string {
@@ -197,30 +227,37 @@ function remove(adjust: Adjust): void {
 
 /* ---------------------------- 状态流转 ---------------------------- */
 
-function nextStateOf(state: AdjustState): AdjustState | null {
-  return ADJUST_STATE_FLOW[state]
+/** 单张认领：把这张待下发单认领进新批次并立即执行（批次内只有它一张） */
+async function claimOne(row: AdjustEnriched): Promise<void> {
+  const result = await batchStore.claimAndRun([row.adjust.id])
+  if (result.status === 'completed' && result.batch) {
+    MessagePlugin.success('已认领并开始执行，执行记录与阀门开度将在同一事务保存')
+  } else if (result.message) {
+    MessagePlugin.warning(result.message)
+  }
 }
 
-const nextStateLabel = (state: AdjustState): string => {
-  const next = nextStateOf(state)
-  if (next === '已调节') return '执行调节'
-  if (next === '已复核') return '复核闭环'
-  return '已闭环'
-}
-
+/** 已调节 → 复核闭环；待下发的执行动作必须走执行批次认领，不能直接点 */
 async function advance(row: AdjustEnriched): Promise<void> {
-  const next = ADJUST_STATE_FLOW[row.adjust.state]
-  if (!next) {
+  if (row.adjust.state === '待下发') {
+    await claimOne(row)
+    return
+  }
+  if (row.adjust.state === '已复核') {
     MessagePlugin.info('该调节单已完成复核闭环')
     return
   }
-  if (next === '已复核') {
-    openReview(row)
-    return
-  }
-  await adjustStore.advance(row.adjust.id)
-  MessagePlugin.success(`已推进为「${next}」，目标开度已回写到阀门台账`)
-  await refreshCounts()
+  openReview(row)
+}
+
+function actionLabel(row: AdjustEnriched): string {
+  if (row.adjust.state === '待下发') return '认领执行'
+  if (row.adjust.state === '已调节') return '复核闭环'
+  return '已闭环'
+}
+
+function batchNameOf(batchId: string): string {
+  return batchStore.batchById.get(batchId)?.name ?? ''
 }
 
 /* ------------------------------ 复核 ------------------------------ */
@@ -253,7 +290,8 @@ function exportCsv(): void {
     stationStore.buildings,
     valveStore.valves,
     rank.measureTable.rows.value,
-    adjustStore.adjusts
+    adjustStore.adjusts,
+    batchStore.batches
   )
   MessagePlugin.success(`已导出 ${filename}`)
 }
@@ -293,6 +331,8 @@ async function onFileChange(event: Event): Promise<void> {
       return
     }
     await importSnapshot(payload)
+    // 旧存档（v3 前导出、无执行批次）首次进入时把旧调节单补成历史批次
+    await batchStore.ensureLegacy()
     MessagePlugin.success('存档已导入')
     await refreshCounts()
   } catch (error) {
@@ -339,7 +379,7 @@ function clearData(): void {
       <div>
         <h2 class="page-head__title">调节单下发与复核</h2>
         <p class="page-head__desc">
-          调节单状态机：待下发 → 已调节（回写阀门开度）→ 已复核（记录复核意见）。
+          待下发调节单先认领进执行批次，页面拿到租约后逐张执行；执行记录与阀门开度同事务保存，换班可从最后完成项接管。
         </p>
       </div>
       <div class="page-head__actions">
@@ -356,6 +396,8 @@ function clearData(): void {
       <StatBadge label="已复核" :value="adjustStore.stateCounts['已复核']" suffix="张" tone="success" />
       <StatBadge label="复核率" :value="adjustStore.reviewedPercent" :percent="adjustStore.reviewedPercent" suffix="%" tone="primary" />
     </div>
+
+    <ExecutionPanel />
 
     <FilterBar
       :model-value="filterModel"
@@ -397,20 +439,40 @@ function clearData(): void {
           <span v-else class="muted">—</span>
         </template>
         <template #openingCell="{ row }">
-          {{ row.valve ? formatOpening(row.valve.currentOpening) : '—' }} →
-          <strong>{{ formatOpening(row.adjust.targetOpening) }}</strong>
+          <div>
+            台账 <span :class="{ 'muted': row.adjust.executedAt > 0 && row.valve && row.valve.currentOpening !== effectiveExecutedOpening(row.adjust) }">{{ row.valve ? formatOpening(row.valve.currentOpening) : '—' }}</span>
+            → 目标 <strong>{{ formatOpening(row.adjust.targetOpening) }}</strong>
+          </div>
+          <div v-if="row.adjust.executedAt > 0">
+            最终执行
+            <strong :title="row.valve && row.valve.currentOpening !== effectiveExecutedOpening(row.adjust) ? '台账开度与执行结果不一致时，以最终执行开度为准' : ''">
+              {{ formatOpening(effectiveExecutedOpening(row.adjust)) }}
+            </strong>
+          </div>
         </template>
         <template #basisCell="{ row }">
           <span class="muted">{{ row.adjust.basis }}</span>
         </template>
         <template #stateCell="{ row }">
-          <t-tag
-            size="small"
-            variant="light"
-            :theme="row.adjust.state === '已复核' ? 'success' : row.adjust.state === '已调节' ? 'primary' : 'warning'"
-          >
-            {{ row.adjust.state }}
-          </t-tag>
+          <div class="toolbar" style="gap: 4px">
+            <t-tag
+              size="small"
+              variant="light"
+              :theme="row.adjust.state === '已复核' ? 'success' : row.adjust.state === '已调节' ? 'primary' : 'warning'"
+            >
+              {{ row.adjust.state }}
+            </t-tag>
+            <t-tag v-if="row.adjust.batchId" size="small" variant="outline" theme="default">
+              {{ batchNameOf(row.adjust.batchId) }}#{{ row.adjust.batchSeq || '—' }}
+            </t-tag>
+          </div>
+        </template>
+        <template #execCell="{ row }">
+          <div v-if="row.adjust.executedAt > 0">
+            <div>{{ formatDateTime(row.adjust.executedAt) }}</div>
+            <div class="muted">{{ row.adjust.executedShift || '—' }}执行</div>
+          </div>
+          <span v-else class="muted">待认领执行</span>
         </template>
         <template #noteCell="{ row }">
           <span class="muted">{{ row.adjust.reviewNote || '—' }}</span>
@@ -421,10 +483,10 @@ function clearData(): void {
               size="small"
               variant="text"
               theme="primary"
-              :disabled="!nextStateOf(row.adjust.state as AdjustState)"
+              :disabled="row.adjust.state === '已复核' || batchStore.busy"
               @click="advance(row)"
             >
-              {{ nextStateLabel(row.adjust.state as AdjustState) }}
+              {{ actionLabel(row) }}
             </t-button>
             <t-button size="small" variant="text" theme="primary" @click="openEdit(row)">编辑</t-button>
             <t-button size="small" variant="text" theme="danger" @click="remove(row.adjust)">删除</t-button>
@@ -446,6 +508,7 @@ function clearData(): void {
           {{ counts.valves ?? 0 }} / {{ counts.measures ?? 0 }}
         </t-descriptions-item>
         <t-descriptions-item label="调节单">{{ counts.adjusts ?? 0 }}</t-descriptions-item>
+        <t-descriptions-item label="执行批次">{{ counts.execBatches ?? 0 }}</t-descriptions-item>
       </t-descriptions>
       <div class="toolbar" style="margin-top: 14px">
         <t-button theme="primary" variant="outline" @click="exportJson">导出全量 JSON</t-button>

@@ -6,7 +6,10 @@ import type { Building } from '@/types/building'
 import type { Valve } from '@/types/valve'
 import type { Measure } from '@/types/measure'
 import type { Adjust } from '@/types/adjust'
+import type { ExecutionBatch } from '@/types/executionBatch'
 import { imbalance, balanceLevel, flowRatio } from '@/utils/balance'
+import { formatDateTime } from '@/utils/datetime'
+import { effectiveExecutedOpening } from '@/types/adjust'
 
 export function download(filename: string, content: string, mime: string): void {
   const blob = new Blob([content], { type: mime })
@@ -37,13 +40,14 @@ export function csvCell(value: string | number): string {
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
 }
 
-/** 导出调节单 CSV（含失衡度与流量比） */
+/** 导出调节单 CSV（含失衡度、流量比与最终执行结果） */
 export function exportAdjustCsv(
   stations: Station[],
   buildings: Building[],
   valves: Valve[],
   measures: Measure[],
-  adjusts: Adjust[]
+  adjusts: Adjust[],
+  batches: ExecutionBatch[] = []
 ): string {
   const header = [
     '换热站',
@@ -58,15 +62,35 @@ export function exportAdjustCsv(
     '室温(℃)',
     '失衡度(%)',
     '判级',
-    '当前开度(%)',
+    '台账当前开度(%)',
     '目标开度(%)',
+    '最终执行开度(%)',
+    '执行时间',
+    '执行班次',
+    '执行批次',
+    '批次序号',
     '调节依据',
     '执行人',
     '状态',
     '复核意见'
   ]
+  const batchById = new Map(batches.map((batch) => [batch.id, batch]))
+  /** 导出顺序：先批次（历史批次最早），批次内按序号；未认领单按创建时间排最后 */
+  const batchRank = (batch: ExecutionBatch | undefined): number => {
+    if (!batch) return Number.MAX_SAFE_INTEGER
+    return batch.kind === 'history' ? 0 : new Date(batch.claimedAt).getTime() || 1
+  }
+  const ordered = [...adjusts].sort((a, b) => {
+    const ba = batchById.get(a.batchId)
+    const bb = batchById.get(b.batchId)
+    const rankDiff = batchRank(ba) - batchRank(bb)
+    if (rankDiff !== 0) return rankDiff
+    const seqDiff = a.batchSeq - b.batchSeq
+    if (seqDiff !== 0) return seqDiff
+    return a.createdAt - b.createdAt
+  })
   const lines: string[] = [header.map(csvCell).join(',')]
-  adjusts.forEach((adjust) => {
+  ordered.forEach((adjust) => {
     const valve = valves.find((item) => item.id === adjust.valveId)
     const building = valve ? buildings.find((item) => item.id === valve.buildingId) ?? null : null
     const station = building ? stations.find((item) => item.id === building.stationId) ?? null : null
@@ -76,6 +100,8 @@ export function exportAdjustCsv(
     const measured = latest ? latest.flowM3h : 0
     const room = latest ? latest.roomTempC : 0
     const value = imbalance(measured, design, room)
+    const batch = batchById.get(adjust.batchId)
+    const finalOpening = effectiveExecutedOpening(adjust)
     lines.push(
       [
         station ? station.name : '—',
@@ -92,6 +118,11 @@ export function exportAdjustCsv(
         balanceLevel(value, measured, design),
         valve ? valve.currentOpening : '—',
         adjust.targetOpening,
+        adjust.executedAt > 0 ? finalOpening : '—',
+        adjust.executedAt > 0 ? formatDateTime(adjust.executedAt) : '—',
+        adjust.executedShift || '—',
+        batch ? batch.name : '—',
+        adjust.batchSeq > 0 ? adjust.batchSeq : '—',
         adjust.basis,
         adjust.executor,
         adjust.state,

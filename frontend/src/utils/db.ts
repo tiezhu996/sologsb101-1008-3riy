@@ -9,9 +9,11 @@ import type { Building } from '@/types/building'
 import type { Valve } from '@/types/valve'
 import type { Measure } from '@/types/measure'
 import type { Adjust } from '@/types/adjust'
+import type { ExecutionBatch } from '@/types/executionBatch'
+import { LEGACY_HISTORY_BATCH_ID, LEGACY_HISTORY_BATCH_NAME } from '@/types/executionBatch'
 
 export const DB_NAME = 'gbheatgrid'
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 export const LS_KEYS = {
   dbVersion: 'gbheatgrid:db-version',
@@ -35,19 +37,22 @@ export interface BackupPayload {
   valves: Valve[]
   measures: Measure[]
   adjusts: Adjust[]
+  /** v3 起随档导出执行批次；旧存档缺省时由 ensureLegacyHistoryBatch 补录 */
+  execBatches?: ExecutionBatch[]
 }
 
 export interface Revisioned {
   revision?: number
 }
 
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 export type StationRow = Station & Revisioned
 export type BuildingRow = Building & Revisioned
 export type ValveRow = Valve & Revisioned
 export type MeasureRow = Measure & Revisioned
 export type AdjustRow = Adjust & Revisioned
+export type ExecutionBatchRow = ExecutionBatch & Revisioned
 
 class HeatGridDatabase extends Dexie {
   stations!: Table<StationRow, string>
@@ -55,6 +60,7 @@ class HeatGridDatabase extends Dexie {
   valves!: Table<ValveRow, string>
   measures!: Table<MeasureRow, string>
   adjusts!: Table<AdjustRow, string>
+  execBatches!: Table<ExecutionBatchRow, string>
 
   constructor() {
     super(DB_NAME)
@@ -112,6 +118,68 @@ class HeatGridDatabase extends Dexie {
             }
           })
       })
+
+    // v3：新增执行批次表（跨页面租约协作）；旧调节单首次进入补成历史批次并回填执行记录
+    this.version(DB_VERSION)
+      .stores({
+        adjusts: 'id, valveId, state, executor, batchId, updatedAt',
+        execBatches: 'id, kind, status, ownerId, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        const legacyAdjusts = (await tx.table('adjusts').toArray()) as Array<Record<string, unknown>>
+        if (legacyAdjusts.length > 0) {
+          const sorted = [...legacyAdjusts].sort(
+            (a, b) => Number(a.createdAt ?? 0) - Number(b.createdAt ?? 0)
+          )
+          let completed = 0
+          sorted.forEach((adjust, index) => {
+            const done = adjust.state === '已调节' || adjust.state === '已复核'
+            adjust.batchId = LEGACY_HISTORY_BATCH_ID
+            adjust.batchSeq = index + 1
+            adjust.executedAt = done ? Number(adjust.updatedAt ?? adjust.createdAt ?? 0) : 0
+            adjust.executedShift = done ? String(adjust.executor ?? '') : ''
+            // 旧单以目标开度作为最终执行结果落档，保证刷新/导出口径一致
+            adjust.executedOpening = done ? Number(adjust.targetOpening ?? 0) : null
+            adjust.revision = ROW_REVISION
+            if (done) completed += 1
+          })
+          const now = Date.now()
+          const allDone = completed === sorted.length
+          const history: Record<string, unknown> = {
+            id: LEGACY_HISTORY_BATCH_ID,
+            name: LEGACY_HISTORY_BATCH_NAME,
+            kind: 'history',
+            adjustIds: sorted.map((item) => String(item.id)),
+            totalCount: sorted.length,
+            completedCount: completed,
+            completedSeq: allDone ? sorted.length : 0,
+            status: allDone ? 'completed' : 'interrupted',
+            ownerId: '',
+            ownerShift: '',
+            leaseVersion: 0,
+            leaseExpiresAt: 0,
+            claimedAt: Number(sorted[0]?.createdAt ?? now),
+            lastHeartbeatAt: 0,
+            finishedAt: allDone ? now : null,
+            note: '升级前存量调节单自动补录为历史批次；待下发单可重新认领进新批次执行',
+            createdAt: now,
+            updatedAt: now,
+            revision: ROW_REVISION
+          }
+          await tx.table('adjusts').clear()
+          await tx.table('adjusts').bulkAdd(sorted)
+          await tx.table('execBatches').put(history)
+        }
+
+        for (const name of ['stations', 'buildings', 'valves', 'measures']) {
+          await tx
+            .table(name)
+            .toCollection()
+            .modify((row: Record<string, unknown>) => {
+              row.revision = ROW_REVISION
+            })
+        }
+      })
   }
 }
 
@@ -141,11 +209,11 @@ const SEED_BUILDINGS: BuildingRow[] = [
 ]
 
 const SEED_VALVES: ValveRow[] = [
-  { id: 'vv-1', buildingId: 'bd-1', stationId: 'st-1', code: 'BL-3-01', dn: 65, currentOpening: 60, designFlowM3h: 32, position: '楼栋总阀', createdAt: stamp(-280), updatedAt: stamp(-2), revision: ROW_REVISION },
+  { id: 'vv-1', buildingId: 'bd-1', stationId: 'st-1', code: 'BL-3-01', dn: 65, currentOpening: 55, designFlowM3h: 32, position: '楼栋总阀', createdAt: stamp(-280), updatedAt: stamp(-6), revision: ROW_REVISION },
   { id: 'vv-2', buildingId: 'bd-1', stationId: 'st-1', code: 'BL-3-02', dn: 50, currentOpening: 45, designFlowM3h: 18, position: '单元立管', createdAt: stamp(-280), updatedAt: stamp(-2), revision: ROW_REVISION },
   { id: 'vv-3', buildingId: 'bd-2', stationId: 'st-1', code: 'BL-5-01', dn: 65, currentOpening: 75, designFlowM3h: 35, position: '楼栋总阀', createdAt: stamp(-279), updatedAt: stamp(-2), revision: ROW_REVISION },
   { id: 'vv-4', buildingId: 'bd-2', stationId: 'st-1', code: 'BL-5-02', dn: 50, currentOpening: 55, designFlowM3h: 20, position: '单元立管', createdAt: stamp(-279), updatedAt: stamp(-2), revision: ROW_REVISION },
-  { id: 'vv-5', buildingId: 'bd-3', stationId: 'st-1', code: 'BL-7-01', dn: 50, currentOpening: 40, designFlowM3h: 22, position: '楼栋总阀', createdAt: stamp(-278), updatedAt: stamp(-3), revision: ROW_REVISION },
+  { id: 'vv-5', buildingId: 'bd-3', stationId: 'st-1', code: 'BL-7-01', dn: 50, currentOpening: 60, designFlowM3h: 22, position: '楼栋总阀', createdAt: stamp(-278), updatedAt: stamp(-4), revision: ROW_REVISION },
   { id: 'vv-6', buildingId: 'bd-3', stationId: 'st-1', code: 'BL-7-02', dn: 40, currentOpening: 35, designFlowM3h: 14, position: '单元立管', createdAt: stamp(-278), updatedAt: stamp(-3), revision: ROW_REVISION },
   { id: 'vv-7', buildingId: 'bd-4', stationId: 'st-2', code: 'BL-A-01', dn: 80, currentOpening: 85, designFlowM3h: 48, position: '楼栋总阀', createdAt: stamp(-260), updatedAt: stamp(-1), revision: ROW_REVISION },
   { id: 'vv-8', buildingId: 'bd-4', stationId: 'st-2', code: 'BL-A-02', dn: 50, currentOpening: 70, designFlowM3h: 22, position: '单元立管', createdAt: stamp(-260), updatedAt: stamp(-1), revision: ROW_REVISION },
@@ -202,19 +270,44 @@ const SEED_MEASURES: MeasureRow[] = [
 ]
 
 const SEED_ADJUSTS: AdjustRow[] = [
-  { id: 'aj-1', valveId: 'vv-1', targetOpening: 55, basis: '3号楼 BL-3-01 失衡度 30.2%，流量比 0.58 明显偏小，需增大开度补流', executor: '王海', state: '已复核', reviewNote: '复核后流量比回升至 0.96，室温 20.4℃，合格', createdAt: stamp(-14), updatedAt: stamp(-6), revision: ROW_REVISION },
-  { id: 'aj-2', valveId: 'vv-5', targetOpening: 60, basis: '7号楼 BL-7-01 失衡度 23.5%，楼栋整体偏小，建议开度由 40% 调至 60%', executor: '赵明', state: '已调节', reviewNote: '', createdAt: stamp(-9), updatedAt: stamp(-4), revision: ROW_REVISION },
-  { id: 'aj-3', valveId: 'vv-9', targetOpening: 62, basis: 'B座 BL-B-01 失衡度 20.2%，流量比 0.74 偏小', executor: '孙倩', state: '待下发', reviewNote: '', createdAt: stamp(-3), updatedAt: stamp(-3), revision: ROW_REVISION },
-  { id: 'aj-4', valveId: 'vv-4', targetOpening: 50, basis: '5号楼 BL-5-02 失衡度 20.0%，流量比 1.23 偏大，需关小阀门', executor: '李强', state: '待下发', reviewNote: '', createdAt: stamp(-2), updatedAt: stamp(-2), revision: ROW_REVISION }
+  { id: 'aj-1', valveId: 'vv-1', targetOpening: 55, basis: '3号楼 BL-3-01 失衡度 30.2%，流量比 0.58 明显偏小，需增大开度补流', executor: '王海', state: '已复核', reviewNote: '复核后流量比回升至 0.96，室温 20.4℃，合格', batchId: LEGACY_HISTORY_BATCH_ID, batchSeq: 1, executedAt: stamp(-7), executedShift: '夜班', executedOpening: 55, createdAt: stamp(-14), updatedAt: stamp(-6), revision: ROW_REVISION },
+  { id: 'aj-2', valveId: 'vv-5', targetOpening: 60, basis: '7号楼 BL-7-01 失衡度 23.5%，楼栋整体偏小，建议开度由 40% 调至 60%', executor: '赵明', state: '已调节', reviewNote: '', batchId: LEGACY_HISTORY_BATCH_ID, batchSeq: 2, executedAt: stamp(-4), executedShift: '夜班', executedOpening: 60, createdAt: stamp(-9), updatedAt: stamp(-4), revision: ROW_REVISION },
+  { id: 'aj-3', valveId: 'vv-9', targetOpening: 62, basis: 'B座 BL-B-01 失衡度 20.2%，流量比 0.74 偏小', executor: '孙倩', state: '待下发', reviewNote: '', batchId: LEGACY_HISTORY_BATCH_ID, batchSeq: 3, executedAt: 0, executedShift: '', executedOpening: null, createdAt: stamp(-3), updatedAt: stamp(-3), revision: ROW_REVISION },
+  { id: 'aj-4', valveId: 'vv-4', targetOpening: 50, basis: '5号楼 BL-5-02 失衡度 20.0%，流量比 1.23 偏大，需关小阀门', executor: '李强', state: '待下发', reviewNote: '', batchId: LEGACY_HISTORY_BATCH_ID, batchSeq: 4, executedAt: 0, executedShift: '', executedOpening: null, createdAt: stamp(-2), updatedAt: stamp(-2), revision: ROW_REVISION }
+]
+
+const SEED_EXEC_BATCHES: ExecutionBatchRow[] = [
+  {
+    id: LEGACY_HISTORY_BATCH_ID,
+    name: LEGACY_HISTORY_BATCH_NAME,
+    kind: 'history',
+    adjustIds: ['aj-1', 'aj-2', 'aj-3', 'aj-4'],
+    totalCount: 4,
+    completedCount: 2,
+    completedSeq: 0,
+    status: 'interrupted',
+    ownerId: '',
+    ownerShift: '',
+    leaseVersion: 0,
+    leaseExpiresAt: 0,
+    claimedAt: stamp(-14),
+    lastHeartbeatAt: 0,
+    finishedAt: null,
+    note: '换班前已执行 2 张，待下发单可重新认领进新批次执行',
+    createdAt: stamp(-14),
+    updatedAt: stamp(-4),
+    revision: ROW_REVISION
+  }
 ]
 
 export async function seedDatabase(): Promise<void> {
-  await db.transaction('rw', db.stations, db.buildings, db.valves, db.measures, db.adjusts, async () => {
+  await db.transaction('rw', [db.stations, db.buildings, db.valves, db.measures, db.adjusts, db.execBatches], async () => {
     await db.stations.bulkPut(SEED_STATIONS)
     await db.buildings.bulkPut(SEED_BUILDINGS)
     await db.valves.bulkPut(SEED_VALVES)
     await db.measures.bulkPut(SEED_MEASURES)
     await db.adjusts.bulkPut(SEED_ADJUSTS)
+    await db.execBatches.bulkPut(SEED_EXEC_BATCHES)
   })
 }
 
@@ -266,23 +359,25 @@ async function deleteValvesOfBuildings(buildingIds: string[]): Promise<void> {
 /* ============================ 整库导入导出 ============================ */
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [stations, buildings, valves, measures, adjusts] = await Promise.all([
+  const [stations, buildings, valves, measures, adjusts, execBatches] = await Promise.all([
     db.stations.count(),
     db.buildings.count(),
     db.valves.count(),
     db.measures.count(),
-    db.adjusts.count()
+    db.adjusts.count(),
+    db.execBatches.count()
   ])
-  return { stations, buildings, valves, measures, adjusts }
+  return { stations, buildings, valves, measures, adjusts, execBatches }
 }
 
 export async function exportSnapshot(): Promise<BackupPayload> {
-  const [stations, buildings, valves, measures, adjusts] = await Promise.all([
+  const [stations, buildings, valves, measures, adjusts, execBatches] = await Promise.all([
     db.stations.toArray(),
     db.buildings.toArray(),
     db.valves.toArray(),
     db.measures.toArray(),
-    db.adjusts.toArray()
+    db.adjusts.toArray(),
+    db.execBatches.toArray()
   ])
   const strip = <T extends Revisioned>(row: T): Omit<T, 'revision'> => {
     const { revision: _revision, ...rest } = row
@@ -296,18 +391,20 @@ export async function exportSnapshot(): Promise<BackupPayload> {
     buildings: buildings.map(strip),
     valves: valves.map(strip),
     measures: measures.map(strip),
-    adjusts: adjusts.map(strip)
+    adjusts: adjusts.map(strip),
+    execBatches: execBatches.map(strip)
   }
 }
 
 export async function importSnapshot(payload: BackupPayload): Promise<void> {
-  await db.transaction('rw', db.stations, db.buildings, db.valves, db.measures, db.adjusts, async () => {
+  await db.transaction('rw', [db.stations, db.buildings, db.valves, db.measures, db.adjusts, db.execBatches], async () => {
     await Promise.all([
       db.stations.clear(),
       db.buildings.clear(),
       db.valves.clear(),
       db.measures.clear(),
-      db.adjusts.clear()
+      db.adjusts.clear(),
+      db.execBatches.clear()
     ])
     const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
     await db.stations.bulkPut((payload.stations ?? []).map(rev))
@@ -315,17 +412,19 @@ export async function importSnapshot(payload: BackupPayload): Promise<void> {
     await db.valves.bulkPut((payload.valves ?? []).map(rev))
     await db.measures.bulkPut((payload.measures ?? []).map(rev))
     await db.adjusts.bulkPut((payload.adjusts ?? []).map(rev))
+    await db.execBatches.bulkPut((payload.execBatches ?? []).map(rev))
   })
 }
 
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', db.stations, db.buildings, db.valves, db.measures, db.adjusts, async () => {
+  await db.transaction('rw', [db.stations, db.buildings, db.valves, db.measures, db.adjusts, db.execBatches], async () => {
     await Promise.all([
       db.stations.clear(),
       db.buildings.clear(),
       db.valves.clear(),
       db.measures.clear(),
-      db.adjusts.clear()
+      db.adjusts.clear(),
+      db.execBatches.clear()
     ])
   })
 }

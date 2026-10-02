@@ -73,16 +73,26 @@ sologsb101-1008/
 | `/valves` | 阀位与设计参数登记 | Valve、Building | 登记口径/位置/开度/设计流量；开度改动进入草稿后可逐条或批量提交；失衡标签与开度校核 |
 | `/measures` | 实测流量/供回水温录入 | Measure、Valve | 按日期成组录入流量与三温；支持「阀门编号,日期,流量,供温,回温,室温,录入人」批量粘贴导入并即时预览失衡度 |
 | `/balance` | 失衡度计算与排序 | Valve、Measure | 按失衡度降序排行；仅看失衡；导出失衡度 CSV；单条/一键生成调节单 |
-| `/adjusts` | 调节单下发与复核 | Adjust、Valve、Measure | 状态机 待下发→已调节（回写阀门开度）→已复核（记录复核意见）；导出调节单 CSV 与全量 JSON |
+| `/adjusts` | 调节单下发与复核 | Adjust、Valve、Measure、ExecutionBatch | 待下发单先认领进执行批次，页面拿到租约后逐张执行（执行记录与阀门开度同事务保存）；租约失效或写入失败后另一页从最后完成项接管；已调节复核闭环；按最终执行结果导出调节单 CSV 与全量 JSON |
 
 ## 五、数据存储说明
 
 - **IndexedDB 库名**：`gbheatgrid`（Dexie 封装，`src/utils/db.ts`）
-- **对象表**：`stations`、`buildings`、`valves`、`measures`、`adjusts`
-- **数据结构版本**：`DB_VERSION = 2`，含 `version(1)` → `version(2)` 的索引变更与 `upgrade()` 迁移（补齐 `revision`、用所属楼栋回填阀门 `stationId` 冗余列、规整开度与复核字段）
+- **对象表**：`stations`、`buildings`、`valves`、`measures`、`adjusts`、`execBatches`
+- **数据结构版本**：`DB_VERSION = 3`，含 `version(1) → version(2) → version(3)` 的索引变更与 `upgrade()` 迁移（v2 补齐 `revision`、回填阀门 `stationId`；v3 新增执行批次表，旧调节单首次进入自动补成历史批次并回填执行记录与最终开度）
 - **首屏自动播种**：`initDatabase()` 中 `if (await db.stations.count() === 0) await seedDatabase()`，播种 2 座换热站 → 5 栋楼 → 10 只阀门 → 20 条实测 → 4 张调节单的互相引用数据；播种幂等
 - **localStorage 辅助键**：`gbheatgrid:db-version`、`gbheatgrid:last-backup-at`、`gbheatgrid:ui-prefs`（上次选中换热站、仅看失衡开关）
 - 应用为**无状态容器**：数据不落容器磁盘、不使用数据库服务、不挂载命名卷
+
+### 跨页面执行批次协作（白班 / 夜班换班）
+
+两个页面（标签页）处理同一批失衡阀门时，下发按**执行批次 + 租约**协作，杜绝重复记录与开度对不上：
+
+1. **认领进批次**：待下发调节单先认领进执行批次（`execBatches`），页面成为批次 owner 并拿到带版本号的 TTL 租约后才能执行；认领是 IndexedDB 原子事务，已被认领的单不会被另一页重复认领。
+2. **拿租约后逐张执行**：每张调节单在单个事务内完成「租约 CAS 校验 → 状态置已调节 → 写执行记录（执行时间/班次/最终开度/批次序号）→ 回写阀门开度」，任何一步失败整体回滚；已完成项不可能被另一页重复处理。
+3. **心跳与失效恢复**：持约页每 5s 心跳续期（TTL 15s）；租约失效或写入失败后，批次标记中断，另一页可从 `completedSeq`（最后完成项）之后接管续跑，接管时 `leaseVersion` 自增使旧持约页全部写操作失效。
+4. **旧单补历史批次**：v3 升级时存量旧调节单自动补成「历史批次」（已执行单回填执行记录），导入旧存档时也会在首次进入页面时幂等补录；历史批次中的待下发旧单可重新认领进新批次。
+5. **最终结果口径**：刷新页面直接展示执行记录中的最终执行开度；CSV/JSON 导出以最终执行结果为准（台账当前开度并列展示，被后续手工改动也不影响执行结果）。
 
 ## 六、本地开发
 
