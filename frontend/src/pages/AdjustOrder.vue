@@ -1,10 +1,12 @@
 <script setup lang="ts">
 /**
  * /adjusts 调节单下发与复核
- * 生成目标开度、执行回填、复核确认并导出全量 JSON。
- * 消费 Adjust、Valve、Measure；复用 <FilterBar>、<EmptyPanel>、<StatBadge>、<BalanceTag>。
+ * 换班协作：待下发调节单先认领进「执行批次」，页面拿到租约后逐张执行；
+ * 执行记录与阀门开度同事务落库，已完成项不被另一页重复处理；
+ * 租约失效/写入失败后另一页可从最后完成项接管恢复。
+ * 消费 Adjust、Valve、Measure、ExecutionBatch；复用公共组件。
  */
-import { computed, reactive, ref, watchEffect } from 'vue'
+import { computed, onMounted, reactive, ref, watchEffect } from 'vue'
 import { MessagePlugin, DialogPlugin } from 'tdesign-vue-next'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar from '@/components/common/FilterBar.vue'
@@ -14,16 +16,17 @@ import { useAdjustStore, type AdjustEnriched } from '@/stores/adjustStore'
 import { useValveStore } from '@/stores/valveStore'
 import { useStationStore } from '@/stores/stationStore'
 import { useImbalanceRank } from '@/hooks/useImbalanceRank'
+import { useExecutionBatches } from '@/hooks/useExecutionBatches'
 import {
   ADJUST_STATES,
-  ADJUST_STATE_FLOW,
   EMPTY_ADJUST_DRAFT,
   type Adjust,
   type AdjustDraft,
   type AdjustState
 } from '@/types/adjust'
 import { basisText, formatOpening } from '@/utils/balance'
-import { exportAdjustCsv } from '@/utils/export'
+import { exportAdjustCsv, formatDateTime } from '@/utils/export'
+import type { ExecutionBatchRow } from '@/utils/db'
 import {
   DB_VERSION,
   clearAllTables,
@@ -43,6 +46,26 @@ const adjustStore = useAdjustStore()
 const valveStore = useValveStore()
 const stationStore = useStationStore()
 const rank = useImbalanceRank()
+const {
+  batches: execBatches,
+  items: execItems,
+  activeBatch,
+  historicalBatches,
+  session,
+  running: execRunning,
+  ownsLease,
+  leasedByOther,
+  leaseRemainingMs,
+  itemsOf,
+  switchShift,
+  claim,
+  claimAndRun,
+  runBatch,
+  stopRunning,
+  retry,
+  backfillHistory,
+  refresh: refreshExec
+} = useExecutionBatches()
 
 // 把最新实测快照灌入调节单 store，用于重算失衡度
 watchEffect(() => {
@@ -62,8 +85,32 @@ const fileInput = ref<HTMLInputElement | null>(null)
 
 void refreshCounts()
 
+// 首次进入：旧调节单（已调节/已复核）幂等补成历史批次，刷新按最终执行结果展示
+onMounted(() => {
+  void backfillHistory()
+    .then((n: number) => {
+      if (n > 0) MessagePlugin.info(`已将 ${n} 张旧调节单补录为历史执行批次`)
+      return refreshExec()
+    })
+    .then(() => refreshCounts())
+    .catch(() => undefined)
+})
+
 async function refreshCounts(): Promise<void> {
   counts.value = await countAll()
+}
+
+/* ------------------------------ 班次身份 ------------------------------ */
+
+const shiftOptions = [
+  { label: '白班', value: '白班' },
+  { label: '夜班', value: '夜班' }
+]
+
+function onShiftChange(value: unknown): void {
+  const shift = value === '夜班' ? '夜班' : '白班'
+  switchShift(shift)
+  MessagePlugin.success(`已切换为${shift}（页签 ${session.tag}）`)
 }
 
 /* ------------------------------ 筛选 ------------------------------ */
@@ -87,14 +134,14 @@ function onFilterChange(model: FilterModel): void {
 const rows = computed(() => adjustStore.filtered)
 
 const columns = [
-  { colKey: 'valve', title: '阀门 / 楼栋', width: 200, cell: 'valveCell' },
-  { colKey: 'imbalance', title: '失衡度', width: 150, cell: 'imbalanceCell' },
-  { colKey: 'opening', title: '当前 → 目标开度', width: 170, cell: 'openingCell' },
-  { colKey: 'basis', title: '调节依据', minWidth: 260, cell: 'basisCell' },
-  { colKey: 'executor', title: '执行人', width: 110 },
-  { colKey: 'state', title: '状态', width: 110, cell: 'stateCell' },
-  { colKey: 'note', title: '复核意见', width: 180, cell: 'noteCell' },
-  { colKey: 'op', title: '操作', width: 250, cell: 'opCell' }
+  { colKey: 'valve', title: '阀门 / 楼栋', width: 190, cell: 'valveCell' },
+  { colKey: 'imbalance', title: '失衡度', width: 140, cell: 'imbalanceCell' },
+  { colKey: 'opening', title: '当前 → 目标 / 最终开度', width: 200, cell: 'openingCell' },
+  { colKey: 'basis', title: '调节依据', minWidth: 240, cell: 'basisCell' },
+  { colKey: 'executor', title: '执行人/批次', width: 150, cell: 'executorCell' },
+  { colKey: 'state', title: '状态', width: 100, cell: 'stateCell' },
+  { colKey: 'note', title: '复核意见', width: 160, cell: 'noteCell' },
+  { colKey: 'op', title: '操作', width: 240, cell: 'opCell' }
 ]
 
 function rowKey(row: AdjustEnriched): string {
@@ -183,7 +230,7 @@ async function submit(): Promise<void> {
 function remove(adjust: Adjust): void {
   const dialog = DialogPlugin.confirm({
     header: '删除确认',
-    body: '确认删除该调节单？删除后不可恢复。',
+    body: '确认删除该调节单？其执行记录将一并从所属批次移除，删除后不可恢复。',
     confirmBtn: '确认删除',
     cancelBtn: '取消',
     onConfirm: async () => {
@@ -195,32 +242,90 @@ function remove(adjust: Adjust): void {
   })
 }
 
-/* ---------------------------- 状态流转 ---------------------------- */
+/* ------------------------ 执行批次：认领 / 执行 ------------------------ */
 
-function nextStateOf(state: AdjustState): AdjustState | null {
-  return ADJUST_STATE_FLOW[state]
+/** 待下发且未认领的调节单（批量认领复选框） */
+const selectedPendingIds = ref<string[]>([])
+
+const pendingRows = computed(() => rows.value.filter((row) => row.adjust.state === '待下发' && !row.adjust.batchId))
+
+const allPendingChecked = computed({
+  get: () => pendingRows.value.length > 0 && pendingRows.value.every((row) => selectedPendingIds.value.includes(row.adjust.id)),
+  set: (checked: boolean) => {
+    selectedPendingIds.value = checked ? pendingRows.value.map((row) => row.adjust.id) : []
+  }
+})
+
+function onPendingCheck(row: AdjustEnriched, checked: boolean): void {
+  const id = row.adjust.id
+  selectedPendingIds.value = checked
+    ? Array.from(new Set([...selectedPendingIds.value, id]))
+    : selectedPendingIds.value.filter((item) => item !== id)
 }
 
-const nextStateLabel = (state: AdjustState): string => {
-  const next = nextStateOf(state)
-  if (next === '已调节') return '执行调节'
-  if (next === '已复核') return '复核闭环'
-  return '已闭环'
+async function claimSelected(runAfter: boolean): Promise<void> {
+  const ids = selectedPendingIds.value.length > 0 ? selectedPendingIds.value : pendingRows.value.map((row) => row.adjust.id)
+  if (ids.length === 0) {
+    MessagePlugin.info('没有待认领的待下发调节单')
+    return
+  }
+  try {
+    if (runAfter) {
+      const summary = await claimAndRun(ids)
+      MessagePlugin[summary.failed > 0 || summary.message.includes('中断') ? 'warning' : 'success'](summary.message)
+    } else {
+      const { claimed } = await claim(ids)
+      MessagePlugin.success(claimed > 0 ? `已认领 ${claimed} 张调节单进执行批次` : '所选调节单此前已被认领')
+    }
+    selectedPendingIds.value = []
+    await refreshCounts()
+  } catch (error) {
+    MessagePlugin.error(error instanceof Error ? error.message : '认领失败')
+  }
 }
 
-async function advance(row: AdjustEnriched): Promise<void> {
-  const next = ADJUST_STATE_FLOW[row.adjust.state]
-  if (!next) {
-    MessagePlugin.info('该调节单已完成复核闭环')
+/** 单张认领并执行 */
+async function claimOne(row: AdjustEnriched): Promise<void> {
+  try {
+    const summary = await claimAndRun([row.adjust.id])
+    MessagePlugin[summary.failed > 0 || summary.message.includes('中断') ? 'warning' : 'success'](summary.message)
+    await refreshCounts()
+  } catch (error) {
+    MessagePlugin.error(error instanceof Error ? error.message : '认领失败')
+  }
+}
+
+async function runActiveBatch(): Promise<void> {
+  const batch = activeBatch.value
+  if (!batch) {
+    MessagePlugin.info('当前没有可执行的批次')
     return
   }
-  if (next === '已复核') {
-    openReview(row)
-    return
-  }
-  await adjustStore.advance(row.adjust.id)
-  MessagePlugin.success(`已推进为「${next}」，目标开度已回写到阀门台账`)
+  const summary = await runBatch(batch.id)
+  MessagePlugin[summary.failed > 0 || summary.message.includes('中断') || summary.message.includes('正被') ? 'warning' : 'success'](
+    summary.message
+  )
   await refreshCounts()
+}
+
+async function takeOverAndRun(): Promise<void> {
+  await runActiveBatch()
+}
+
+async function pauseBatch(): Promise<void> {
+  await stopRunning()
+  MessagePlugin.info('已暂停并释放租约，另一页可接管继续执行')
+}
+
+async function retryBatch(batch: ExecutionBatchRow): Promise<void> {
+  try {
+    const reset = await retry(batch.id)
+    MessagePlugin.success(`已重置 ${reset} 个失败项，继续执行`)
+    const summary = await runBatch(batch.id)
+    MessagePlugin[summary.failed > 0 ? 'warning' : 'success'](summary.message)
+  } catch (error) {
+    MessagePlugin.error(error instanceof Error ? error.message : '重试失败')
+  }
 }
 
 /* ------------------------------ 复核 ------------------------------ */
@@ -245,6 +350,32 @@ async function submitReview(): Promise<void> {
   await refreshCounts()
 }
 
+/** 行内主操作已拆分为认领执行 / 查看批次 / 复核闭环按钮，见模板 opCell */
+
+/* ---------------------------- 批次视图派生 ---------------------------- */
+
+function batchProgress(batch: ExecutionBatchRow): { percent: number; text: string } {
+  const done = batch.completedCount
+  const percent = batch.itemCount === 0 ? 0 : Math.round((done / batch.itemCount) * 100)
+  return { percent, text: `${done} / ${batch.itemCount}` }
+}
+
+function leaseText(batch: ExecutionBatchRow): string {
+  if (ownsLease(batch)) return `本页持约 · 剩 ${Math.ceil(leaseRemainingMs(batch) / 1000)}s`
+  if (leasedByOther(batch)) return `${batch.leaseOwner} 执行中 · 剩 ${Math.ceil(leaseRemainingMs(batch) / 1000)}s`
+  return '租约空闲 · 可接管'
+}
+
+const batchStateTheme = (state: ExecutionBatchRow['state']): 'success' | 'warning' | 'primary' | 'danger' | 'default' => {
+  if (state === '已完成') return 'success'
+  if (state === '历史批次') return 'default'
+  if (state === '已中断') return 'danger'
+  if (state === '执行中') return 'primary'
+  return 'warning'
+}
+
+const activeBatchItems = computed(() => (activeBatch.value ? itemsOf(activeBatch.value.id) : []))
+
 /* ---------------------------- 备份导出 ---------------------------- */
 
 function exportCsv(): void {
@@ -253,7 +384,9 @@ function exportCsv(): void {
     stationStore.buildings,
     valveStore.valves,
     rank.measureTable.rows.value,
-    adjustStore.adjusts
+    adjustStore.adjusts,
+    execItems.value,
+    execBatches.value
   )
   MessagePlugin.success(`已导出 ${filename}`)
 }
@@ -339,7 +472,7 @@ function clearData(): void {
       <div>
         <h2 class="page-head__title">调节单下发与复核</h2>
         <p class="page-head__desc">
-          调节单状态机：待下发 → 已调节（回写阀门开度）→ 已复核（记录复核意见）。
+          待下发调节单先认领进执行批次，页面拿到租约后逐张执行；执行记录与阀门开度同事务落库，换班不重复、开度对得上。
         </p>
       </div>
       <div class="page-head__actions">
@@ -357,6 +490,141 @@ function clearData(): void {
       <StatBadge label="复核率" :value="adjustStore.reviewedPercent" :percent="adjustStore.reviewedPercent" suffix="%" tone="primary" />
     </div>
 
+    <!-- 班次身份与执行批次协作 -->
+    <div class="panel" style="margin-top: 16px">
+      <div class="panel-head">
+        <h3 class="panel-title" style="margin: 0">执行批次协作</h3>
+        <div class="toolbar">
+          <span class="muted">当前班次</span>
+          <t-radio-group
+            :value="session.shift"
+            variant="default-filled"
+            size="small"
+            :options="shiftOptions"
+            @change="onShiftChange"
+          />
+          <t-tag size="small" theme="primary" variant="light">
+            {{ session.shift }} · 页签 {{ session.tag }}
+          </t-tag>
+        </div>
+      </div>
+
+      <!-- 存在未完成批次：展示租约与接管 -->
+      <div v-if="activeBatch" class="batch-card">
+        <div class="batch-card__head">
+          <div>
+            <t-tag size="small" :theme="batchStateTheme(activeBatch.state)" variant="light">
+              {{ activeBatch.state }}
+            </t-tag>
+            <strong style="margin-left: 8px">{{ activeBatch.name }}</strong>
+          </div>
+          <span class="muted">{{ leaseText(activeBatch) }}</span>
+        </div>
+        <t-progress
+          :percentage="batchProgress(activeBatch).percent"
+          :label="true"
+          style="margin: 10px 0"
+        />
+        <div class="muted" style="margin-bottom: 10px">
+          进度 {{ batchProgress(activeBatch).text }}
+          <template v-if="activeBatch.failedCount > 0">
+            ，失败 {{ activeBatch.failedCount }} 项（最后完成序号 {{ activeBatch.lastCompletedSeq }}，可接管续跑）
+          </template>
+          <template v-else>
+            ，最后完成序号 {{ activeBatch.lastCompletedSeq }}
+          </template>
+        </div>
+
+        <ul class="batch-items">
+          <li v-for="item in activeBatchItems" :key="item.id" class="batch-items__li">
+            <span class="batch-items__seq">{{ item.seq }}</span>
+            <span>{{ item.valveId }}</span>
+            <t-tag
+              size="small"
+              variant="light"
+              :theme="item.status === '已完成' ? 'success' : item.status === '失败' ? 'danger' : 'warning'"
+            >
+              {{ item.status }}
+            </t-tag>
+            <span v-if="item.executedOpening !== null" class="muted">
+              最终开度 {{ item.executedOpening }}% · {{ formatDateTime(item.executedAt) }} · {{ item.executedBy }}
+            </span>
+            <span v-else-if="item.status === '失败'" class="muted" style="color: #c0392b">
+              {{ item.failReason }}
+            </span>
+            <span v-else class="muted">待执行（目标 {{ item.targetOpening }}%）</span>
+          </li>
+        </ul>
+
+        <div class="toolbar" style="margin-top: 12px">
+          <t-button
+            v-if="ownsLease(activeBatch) && execRunning"
+            theme="warning"
+            variant="outline"
+            @click="pauseBatch"
+          >
+            暂停并释放租约
+          </t-button>
+          <t-button
+            v-else-if="ownsLease(activeBatch)"
+            theme="primary"
+            :loading="execRunning"
+            @click="runActiveBatch"
+          >
+            继续执行本批次
+          </t-button>
+          <t-button
+            v-else-if="!leasedByOther(activeBatch)"
+            theme="primary"
+            :loading="execRunning"
+            @click="takeOverAndRun"
+          >
+            接管租约并从最后完成项续跑
+          </t-button>
+          <t-tag v-else size="small" theme="primary" variant="light">
+            租约内不可抢占，等待 {{ activeBatch.leaseOwner }} 释放或租约到期
+          </t-tag>
+          <t-button
+            v-if="activeBatch.failedCount > 0 && !leasedByOther(activeBatch)"
+            theme="danger"
+            variant="outline"
+            :disabled="execRunning"
+            @click="retryBatch(activeBatch)"
+          >
+            重试失败项并续跑
+          </t-button>
+        </div>
+      </div>
+
+      <!-- 无未完成批次：认领待下发调节单 -->
+      <div v-else>
+        <p class="muted" style="margin: 4px 0 10px">
+          待下发调节单需先认领进批次，拿到租约后才逐张执行；已被认领的不会在另一页重复处理。
+        </p>
+        <div class="toolbar">
+          <t-button theme="primary" :disabled="pendingRows.length === 0 || execRunning" @click="claimSelected(true)">
+            {{ selectedPendingIds.length > 0 ? `认领选中 ${selectedPendingIds.length} 张并执行` : '一键认领全部待下发并执行' }}
+          </t-button>
+          <t-button variant="outline" :disabled="pendingRows.length === 0 || execRunning" @click="claimSelected(false)">
+            仅认领进批次
+          </t-button>
+          <t-checkbox v-if="pendingRows.length > 0" :checked="allPendingChecked" @change="(v: boolean) => (allPendingChecked = v)">
+            全选待下发（{{ pendingRows.length }}）
+          </t-checkbox>
+        </div>
+      </div>
+
+      <!-- 历史批次 -->
+      <div v-if="historicalBatches.length > 0" style="margin-top: 12px">
+        <p class="muted" style="margin: 0 0 6px">历史执行批次（旧调节单首次进入已补录，按最终执行结果留存）：</p>
+        <div v-for="batch in historicalBatches" :key="batch.id" class="batch-history">
+          <t-tag size="small" theme="default" variant="light">{{ batch.state }}</t-tag>
+          <span style="margin-left: 8px">{{ batch.name }}</span>
+          <span class="muted" style="margin-left: 8px">{{ batch.completedCount }} 张 · {{ formatDateTime(batch.createdAt) }}</span>
+        </div>
+      </div>
+    </div>
+
     <FilterBar
       :model-value="filterModel"
       :selects="filterSelects"
@@ -367,7 +635,7 @@ function clearData(): void {
     <div class="panel" style="margin-top: 16px">
       <div class="panel-head">
         <h3 class="panel-title" style="margin: 0">调节单（{{ rows.length }} / {{ adjustStore.adjusts.length }}）</h3>
-        <span class="muted">执行人未指派时可先下发，执行后回填</span>
+        <span class="muted">最终开度以执行记录为准；执行记录与阀门开度同事务保存</span>
       </div>
 
       <EmptyPanel
@@ -397,11 +665,23 @@ function clearData(): void {
           <span v-else class="muted">—</span>
         </template>
         <template #openingCell="{ row }">
-          {{ row.valve ? formatOpening(row.valve.currentOpening) : '—' }} →
-          <strong>{{ formatOpening(row.adjust.targetOpening) }}</strong>
+          <div>
+            {{ row.valve ? formatOpening(row.valve.currentOpening) : '—' }} →
+            目标 <strong>{{ formatOpening(row.adjust.targetOpening) }}</strong>
+          </div>
+          <div v-if="row.finalOpening !== null" class="muted">
+            最终执行 <strong style="color: #1e8449">{{ formatOpening(row.finalOpening) }}</strong>
+          </div>
+          <div v-else class="muted">尚未执行</div>
         </template>
         <template #basisCell="{ row }">
           <span class="muted">{{ row.adjust.basis }}</span>
+        </template>
+        <template #executorCell="{ row }">
+          <div>{{ row.execution && row.execution.executedBy ? row.execution.executedBy : row.adjust.executor }}</div>
+          <div v-if="row.execution && row.execution.executedAt" class="muted">
+            {{ formatDateTime(row.execution.executedAt) }}
+          </div>
         </template>
         <template #stateCell="{ row }">
           <t-tag
@@ -417,15 +697,40 @@ function clearData(): void {
         </template>
         <template #opCell="{ row }">
           <div class="toolbar">
+            <t-checkbox
+              v-if="row.adjust.state === '待下发' && !row.adjust.batchId"
+              :checked="selectedPendingIds.includes(row.adjust.id)"
+              @change="(checked: boolean) => onPendingCheck(row, checked)"
+            />
             <t-button
+              v-if="row.adjust.state === '待下发' && !row.adjust.batchId"
               size="small"
               variant="text"
               theme="primary"
-              :disabled="!nextStateOf(row.adjust.state as AdjustState)"
-              @click="advance(row)"
+              :disabled="execRunning"
+              @click="claimOne(row)"
             >
-              {{ nextStateLabel(row.adjust.state as AdjustState) }}
+              认领并执行
             </t-button>
+            <t-button
+              v-else-if="row.adjust.state === '待下发' && row.adjust.batchId"
+              size="small"
+              variant="text"
+              theme="primary"
+              @click="runActiveBatch"
+            >
+              查看批次
+            </t-button>
+            <t-button
+              v-else-if="row.adjust.state === '已调节'"
+              size="small"
+              variant="text"
+              theme="primary"
+              @click="openReview(row)"
+            >
+              复核闭环
+            </t-button>
+            <t-tag v-else size="small" theme="success" variant="light">已闭环</t-tag>
             <t-button size="small" variant="text" theme="primary" @click="openEdit(row)">编辑</t-button>
             <t-button size="small" variant="text" theme="danger" @click="remove(row.adjust)">删除</t-button>
           </div>
@@ -445,7 +750,9 @@ function clearData(): void {
         <t-descriptions-item label="阀门 / 实测">
           {{ counts.valves ?? 0 }} / {{ counts.measures ?? 0 }}
         </t-descriptions-item>
-        <t-descriptions-item label="调节单">{{ counts.adjusts ?? 0 }}</t-descriptions-item>
+        <t-descriptions-item label="调节单 / 执行批次">
+          {{ counts.adjusts ?? 0 }} / {{ counts.executionBatches ?? 0 }}
+        </t-descriptions-item>
       </t-descriptions>
       <div class="toolbar" style="margin-top: 14px">
         <t-button theme="primary" variant="outline" @click="exportJson">导出全量 JSON</t-button>
@@ -499,7 +806,7 @@ function clearData(): void {
       @confirm="submitReview"
     >
       <t-textarea v-model="reviewNote" :autosize="{ minRows: 3, maxRows: 6 }" placeholder="填写复核结论" />
-      <p class="muted">复核后调节单状态置为「已复核」，并保留复核意见。</p>
+      <p class="muted">复核后调节单状态置为「已复核」，并保留复核意见；执行开度以批次执行记录为准。</p>
     </t-dialog>
   </div>
 </template>

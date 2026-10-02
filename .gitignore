@@ -26,3 +26,6 @@ Thumbs.db
 .vite/
 *.tsbuildinfo
 tsconfig.tsbuildinfo
+
+# 执行批次逻辑验证脚本的 esbuild 构建产物（保留 preload 源文件）
+frontend/scripts/verify-batches.cjs

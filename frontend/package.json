@@ -8,7 +8,8 @@
     "dev": "vite --host --port 22808",
     "build": "vue-tsc --noEmit && vite build",
     "typecheck": "vue-tsc --noEmit",
-    "preview": "vite preview --host --port 22808"
+    "preview": "vite preview --host --port 22808",
+    "verify:batches": "esbuild scripts/verify-batches.ts --bundle --platform=node --format=cjs --outfile=scripts/verify-batches.cjs --alias:@=./src && node -r ./scripts/fake-idb-preload.cjs scripts/verify-batches.cjs"
   },
   "dependencies": {
     "dexie": "^4.0.11",
@@ -21,6 +22,8 @@
   "devDependencies": {
     "@types/node": "^22.10.5",
     "@vitejs/plugin-vue": "^5.2.1",
+    "esbuild": "^0.28.2",
+    "fake-indexeddb": "^6.2.5",
     "typescript": "~5.7.3",
     "vite": "^6.1.0",
     "vue-tsc": "^2.2.0"

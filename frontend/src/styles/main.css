@@ -260,3 +260,57 @@ body {
   align-items: center;
   gap: 8px;
 }
+
+/* 执行批次协作 */
+.batch-card {
+  border: 1px solid var(--td-border-level-2-color, #e7e7e7);
+  border-radius: 6px;
+  padding: 14px 16px;
+  background: var(--td-bg-color-container-hover, #fafafa);
+}
+
+.batch-card__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.batch-items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.batch-items__li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+
+.batch-items__seq {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 6px;
+  border-radius: 11px;
+  background: var(--td-brand-color, #0052d9);
+  color: #fff;
+  font-size: 12px;
+}
+
+.batch-history {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 0;
+  font-size: 13px;
+}

@@ -12,6 +12,8 @@ export interface Adjust {
   state: AdjustState
   /** 复核意见 */
   reviewNote: string
+  /** 认领进的执行批次 id；未认领（待下发）时为空 */
+  batchId?: string
   createdAt: number
   updatedAt: number
 }

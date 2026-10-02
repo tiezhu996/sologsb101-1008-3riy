@@ -6,6 +6,7 @@ import type { Building } from '@/types/building'
 import type { Valve } from '@/types/valve'
 import type { Measure } from '@/types/measure'
 import type { Adjust } from '@/types/adjust'
+import type { ExecutionBatch, ExecutionItem } from '@/types/executionBatch'
 import { imbalance, balanceLevel, flowRatio } from '@/utils/balance'
 
 export function download(filename: string, content: string, mime: string): void {
@@ -37,14 +38,26 @@ export function csvCell(value: string | number): string {
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
 }
 
-/** 导出调节单 CSV（含失衡度与流量比） */
+/** 毫秒时间戳格式化为 yyyy-mm-dd HH:MM，空值返回 — */
+export function formatDateTime(value: number | null | undefined): string {
+  if (!value || !Number.isFinite(value)) return '—'
+  const date = new Date(value)
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+/** 导出调节单 CSV（含失衡度、流量比与最终执行结果） */
 export function exportAdjustCsv(
   stations: Station[],
   buildings: Building[],
   valves: Valve[],
   measures: Measure[],
-  adjusts: Adjust[]
+  adjusts: Adjust[],
+  executionItems: ExecutionItem[] = [],
+  executionBatches: ExecutionBatch[] = []
 ): string {
+  const itemByAdjust = new Map(executionItems.map((item) => [item.adjustId, item]))
+  const batchById = new Map(executionBatches.map((batch) => [batch.id, batch]))
   const header = [
     '换热站',
     '楼栋',
@@ -60,8 +73,11 @@ export function exportAdjustCsv(
     '判级',
     '当前开度(%)',
     '目标开度(%)',
-    '调节依据',
+    '执行批次',
+    '最终执行开度(%)',
+    '执行时间',
     '执行人',
+    '调节依据',
     '状态',
     '复核意见'
   ]
@@ -76,6 +92,15 @@ export function exportAdjustCsv(
     const measured = latest ? latest.flowM3h : 0
     const room = latest ? latest.roomTempC : 0
     const value = imbalance(measured, design, room)
+    // 刷新与导出按最终执行结果展示：执行记录优先
+    const item = itemByAdjust.get(adjust.id) ?? null
+    const batch = item ? batchById.get(item.batchId) ?? null : null
+    const finalOpening =
+      item && item.executedOpening !== null
+        ? item.executedOpening
+        : adjust.state !== '待下发' && valve
+          ? valve.currentOpening
+          : null
     lines.push(
       [
         station ? station.name : '—',
@@ -92,8 +117,11 @@ export function exportAdjustCsv(
         balanceLevel(value, measured, design),
         valve ? valve.currentOpening : '—',
         adjust.targetOpening,
+        batch ? batch.name : adjust.batchId ? '执行批次' : '—',
+        finalOpening !== null ? finalOpening : '—',
+        item && item.executedAt ? formatDateTime(item.executedAt) : '—',
+        item && item.executedBy ? item.executedBy : adjust.executor,
         adjust.basis,
-        adjust.executor,
         adjust.state,
         adjust.reviewNote
       ]

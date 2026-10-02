@@ -9,14 +9,16 @@ import type { Building } from '@/types/building'
 import type { Valve } from '@/types/valve'
 import type { Measure } from '@/types/measure'
 import type { Adjust } from '@/types/adjust'
+import type { ExecutionBatch, ExecutionItem } from '@/types/executionBatch'
 
 export const DB_NAME = 'gbheatgrid'
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 export const LS_KEYS = {
   dbVersion: 'gbheatgrid:db-version',
   lastBackupAt: 'gbheatgrid:last-backup-at',
-  uiPrefs: 'gbheatgrid:ui-prefs'
+  uiPrefs: 'gbheatgrid:ui-prefs',
+  shiftTag: 'gbheatgrid:shift-tag'
 } as const
 
 export interface UiPrefs {
@@ -35,6 +37,8 @@ export interface BackupPayload {
   valves: Valve[]
   measures: Measure[]
   adjusts: Adjust[]
+  executionBatches: ExecutionBatch[]
+  executionItems: ExecutionItem[]
 }
 
 export interface Revisioned {
@@ -48,6 +52,8 @@ export type BuildingRow = Building & Revisioned
 export type ValveRow = Valve & Revisioned
 export type MeasureRow = Measure & Revisioned
 export type AdjustRow = Adjust & Revisioned
+export type ExecutionBatchRow = ExecutionBatch & Revisioned
+export type ExecutionItemRow = ExecutionItem & Revisioned
 
 class HeatGridDatabase extends Dexie {
   stations!: Table<StationRow, string>
@@ -55,6 +61,8 @@ class HeatGridDatabase extends Dexie {
   valves!: Table<ValveRow, string>
   measures!: Table<MeasureRow, string>
   adjusts!: Table<AdjustRow, string>
+  executionBatches!: Table<ExecutionBatchRow, string>
+  executionItems!: Table<ExecutionItemRow, string>
 
   constructor() {
     super(DB_NAME)
@@ -110,6 +118,27 @@ class HeatGridDatabase extends Dexie {
             if (adjust.state !== '待下发' && adjust.state !== '已调节' && adjust.state !== '已复核') {
               adjust.state = '待下发'
             }
+          })
+      })
+
+    // v3：新增「执行批次 / 执行项」协作模型；调节单补 batchId 归属列
+    this.version(DB_VERSION)
+      .stores({
+        stations: 'id, name, commissionYear, updatedAt',
+        buildings: 'id, stationId, name, heatMode, updatedAt',
+        valves: 'id, buildingId, stationId, code, position, updatedAt',
+        measures: 'id, valveId, date, operator, updatedAt',
+        adjusts: 'id, valveId, state, executor, batchId, updatedAt',
+        executionBatches: 'id, state, leaseOwner, leaseUntil, isHistorical, updatedAt',
+        executionItems: 'id, batchId, adjustId, valveId, status, seq, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        // 旧库的调节单补齐 batchId 空列（历史批次由页面首次进入时幂等补录，而非在迁移期写业务数据）
+        await tx
+          .table('adjusts')
+          .toCollection()
+          .modify((adjust: Record<string, unknown>) => {
+            if (typeof adjust.batchId !== 'string') adjust.batchId = ''
           })
       })
   }
@@ -202,10 +231,10 @@ const SEED_MEASURES: MeasureRow[] = [
 ]
 
 const SEED_ADJUSTS: AdjustRow[] = [
-  { id: 'aj-1', valveId: 'vv-1', targetOpening: 55, basis: '3号楼 BL-3-01 失衡度 30.2%，流量比 0.58 明显偏小，需增大开度补流', executor: '王海', state: '已复核', reviewNote: '复核后流量比回升至 0.96，室温 20.4℃，合格', createdAt: stamp(-14), updatedAt: stamp(-6), revision: ROW_REVISION },
-  { id: 'aj-2', valveId: 'vv-5', targetOpening: 60, basis: '7号楼 BL-7-01 失衡度 23.5%，楼栋整体偏小，建议开度由 40% 调至 60%', executor: '赵明', state: '已调节', reviewNote: '', createdAt: stamp(-9), updatedAt: stamp(-4), revision: ROW_REVISION },
-  { id: 'aj-3', valveId: 'vv-9', targetOpening: 62, basis: 'B座 BL-B-01 失衡度 20.2%，流量比 0.74 偏小', executor: '孙倩', state: '待下发', reviewNote: '', createdAt: stamp(-3), updatedAt: stamp(-3), revision: ROW_REVISION },
-  { id: 'aj-4', valveId: 'vv-4', targetOpening: 50, basis: '5号楼 BL-5-02 失衡度 20.0%，流量比 1.23 偏大，需关小阀门', executor: '李强', state: '待下发', reviewNote: '', createdAt: stamp(-2), updatedAt: stamp(-2), revision: ROW_REVISION }
+  { id: 'aj-1', valveId: 'vv-1', targetOpening: 55, basis: '3号楼 BL-3-01 失衡度 30.2%，流量比 0.58 明显偏小，需增大开度补流', executor: '王海', state: '已复核', reviewNote: '复核后流量比回升至 0.96，室温 20.4℃，合格', batchId: '', createdAt: stamp(-14), updatedAt: stamp(-6), revision: ROW_REVISION },
+  { id: 'aj-2', valveId: 'vv-5', targetOpening: 60, basis: '7号楼 BL-7-01 失衡度 23.5%，楼栋整体偏小，建议开度由 40% 调至 60%', executor: '赵明', state: '已调节', reviewNote: '', batchId: '', createdAt: stamp(-9), updatedAt: stamp(-4), revision: ROW_REVISION },
+  { id: 'aj-3', valveId: 'vv-9', targetOpening: 62, basis: 'B座 BL-B-01 失衡度 20.2%，流量比 0.74 偏小', executor: '孙倩', state: '待下发', reviewNote: '', batchId: '', createdAt: stamp(-3), updatedAt: stamp(-3), revision: ROW_REVISION },
+  { id: 'aj-4', valveId: 'vv-4', targetOpening: 50, basis: '5号楼 BL-5-02 失衡度 20.0%，流量比 1.23 偏大，需关小阀门', executor: '李强', state: '待下发', reviewNote: '', batchId: '', createdAt: stamp(-2), updatedAt: stamp(-2), revision: ROW_REVISION }
 ]
 
 export async function seedDatabase(): Promise<void> {
@@ -228,27 +257,95 @@ export async function initDatabase(): Promise<void> {
 
 /* ============================== 级联删除 ============================== */
 
-export async function deleteStationCascade(stationId: string): Promise<void> {
-  await db.transaction('rw', db.stations, db.buildings, db.valves, db.measures, db.adjusts, async () => {
-    const buildings = await db.buildings.where('stationId').equals(stationId).toArray()
-    await deleteValvesOfBuildings(buildings.map((item) => item.id))
-    if (buildings.length > 0) await db.buildings.bulkDelete(buildings.map((item) => item.id))
-    await db.stations.delete(stationId)
+/**
+ * 删除指定执行项后，重算所属批次计数；批次已无执行项时连同批次一并删除，
+ * 避免留下空壳批次与失效租约。
+ */
+async function cleanupExecutionItems(itemIds: string[]): Promise<void> {
+  if (itemIds.length === 0) return
+  const items = await db.executionItems.where('id').anyOf(itemIds).toArray()
+  const batchIds = Array.from(new Set(items.map((item) => item.batchId)))
+  await db.executionItems.bulkDelete(itemIds)
+  for (const batchId of batchIds) {
+    const remaining = await db.executionItems.where('batchId').equals(batchId).count()
+    if (remaining === 0) {
+      await db.executionBatches.delete(batchId)
+    } else {
+      await recomputeBatchCounters(batchId)
+    }
+  }
+}
+
+/** 按执行项实际状态重算批次统计与完成水位 */
+async function recomputeBatchCounters(batchId: string): Promise<void> {
+  const batch = await db.executionBatches.get(batchId)
+  if (!batch) return
+  const items = await db.executionItems.where('batchId').equals(batchId).toArray()
+  const completed = items.filter((item) => item.status === '已完成').length
+  const failed = items.filter((item) => item.status === '失败').length
+  const lastCompletedSeq = items
+    .filter((item) => item.status === '已完成')
+    .reduce((max, item) => Math.max(max, item.seq), 0)
+  const nextState =
+    items.length === 0
+      ? batch.state
+      : completed === items.length
+        ? '已完成'
+        : failed > 0
+          ? '已中断'
+          : batch.state
+  await db.executionBatches.update(batchId, {
+    itemCount: items.length,
+    completedCount: completed,
+    failedCount: failed,
+    lastCompletedSeq,
+    state: nextState,
+    updatedAt: Date.now()
   })
+}
+
+export async function deleteStationCascade(stationId: string): Promise<void> {
+  await db.transaction(
+    'rw',
+    [db.stations, db.buildings, db.valves, db.measures, db.adjusts, db.executionItems, db.executionBatches],
+    async () => {
+      const buildings = await db.buildings.where('stationId').equals(stationId).toArray()
+      await deleteValvesOfBuildings(buildings.map((item) => item.id))
+      if (buildings.length > 0) await db.buildings.bulkDelete(buildings.map((item) => item.id))
+      await db.stations.delete(stationId)
+    }
+  )
 }
 
 export async function deleteBuildingCascade(buildingId: string): Promise<void> {
-  await db.transaction('rw', db.buildings, db.valves, db.measures, db.adjusts, async () => {
-    await deleteValvesOfBuildings([buildingId])
-    await db.buildings.delete(buildingId)
-  })
+  await db.transaction(
+    'rw',
+    [db.buildings, db.valves, db.measures, db.adjusts, db.executionItems, db.executionBatches],
+    async () => {
+      await deleteValvesOfBuildings([buildingId])
+      await db.buildings.delete(buildingId)
+    }
+  )
 }
 
 export async function deleteValveCascade(valveId: string): Promise<void> {
-  await db.transaction('rw', db.valves, db.measures, db.adjusts, async () => {
+  await db.transaction('rw', db.valves, db.measures, db.adjusts, db.executionItems, db.executionBatches, async () => {
     await db.measures.where('valveId').equals(valveId).delete()
-    await db.adjusts.where('valveId').equals(valveId).delete()
+    const adjusts = await db.adjusts.where('valveId').equals(valveId).toArray()
+    if (adjusts.length > 0) await db.adjusts.bulkDelete(adjusts.map((item) => item.id))
+    await cleanupExecutionItems(
+      (await db.executionItems.where('valveId').equals(valveId).toArray()).map((item) => item.id)
+    )
     await db.valves.delete(valveId)
+  })
+}
+
+/** 删除单张调节单：连带删除其执行项并重算/清空所属批次，避免孤儿执行项卡住批次 */
+export async function deleteAdjustCascade(adjustId: string): Promise<void> {
+  await db.transaction('rw', db.adjusts, db.executionItems, db.executionBatches, async () => {
+    await db.adjusts.delete(adjustId)
+    const items = await db.executionItems.where('adjustId').equals(adjustId).toArray()
+    await cleanupExecutionItems(items.map((item) => item.id))
   })
 }
 
@@ -258,7 +355,10 @@ async function deleteValvesOfBuildings(buildingIds: string[]): Promise<void> {
   const valveIds = valves.map((valve) => valve.id)
   if (valveIds.length > 0) {
     await db.measures.where('valveId').anyOf(valveIds).delete()
-    await db.adjusts.where('valveId').anyOf(valveIds).delete()
+    const adjusts = await db.adjusts.where('valveId').anyOf(valveIds).toArray()
+    if (adjusts.length > 0) await db.adjusts.bulkDelete(adjusts.map((item) => item.id))
+    const items = await db.executionItems.where('valveId').anyOf(valveIds).toArray()
+    await cleanupExecutionItems(items.map((item) => item.id))
     await db.valves.bulkDelete(valveIds)
   }
 }
@@ -266,23 +366,27 @@ async function deleteValvesOfBuildings(buildingIds: string[]): Promise<void> {
 /* ============================ 整库导入导出 ============================ */
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [stations, buildings, valves, measures, adjusts] = await Promise.all([
+  const [stations, buildings, valves, measures, adjusts, executionBatches, executionItems] = await Promise.all([
     db.stations.count(),
     db.buildings.count(),
     db.valves.count(),
     db.measures.count(),
-    db.adjusts.count()
+    db.adjusts.count(),
+    db.executionBatches.count(),
+    db.executionItems.count()
   ])
-  return { stations, buildings, valves, measures, adjusts }
+  return { stations, buildings, valves, measures, adjusts, executionBatches, executionItems }
 }
 
 export async function exportSnapshot(): Promise<BackupPayload> {
-  const [stations, buildings, valves, measures, adjusts] = await Promise.all([
+  const [stations, buildings, valves, measures, adjusts, executionBatches, executionItems] = await Promise.all([
     db.stations.toArray(),
     db.buildings.toArray(),
     db.valves.toArray(),
     db.measures.toArray(),
-    db.adjusts.toArray()
+    db.adjusts.toArray(),
+    db.executionBatches.toArray(),
+    db.executionItems.toArray()
   ])
   const strip = <T extends Revisioned>(row: T): Omit<T, 'revision'> => {
     const { revision: _revision, ...rest } = row
@@ -296,38 +400,54 @@ export async function exportSnapshot(): Promise<BackupPayload> {
     buildings: buildings.map(strip),
     valves: valves.map(strip),
     measures: measures.map(strip),
-    adjusts: adjusts.map(strip)
+    adjusts: adjusts.map(strip),
+    executionBatches: executionBatches.map(strip),
+    executionItems: executionItems.map(strip)
   }
 }
 
 export async function importSnapshot(payload: BackupPayload): Promise<void> {
-  await db.transaction('rw', db.stations, db.buildings, db.valves, db.measures, db.adjusts, async () => {
-    await Promise.all([
-      db.stations.clear(),
-      db.buildings.clear(),
-      db.valves.clear(),
-      db.measures.clear(),
-      db.adjusts.clear()
-    ])
-    const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
-    await db.stations.bulkPut((payload.stations ?? []).map(rev))
-    await db.buildings.bulkPut((payload.buildings ?? []).map(rev))
-    await db.valves.bulkPut((payload.valves ?? []).map(rev))
-    await db.measures.bulkPut((payload.measures ?? []).map(rev))
-    await db.adjusts.bulkPut((payload.adjusts ?? []).map(rev))
-  })
+  await db.transaction(
+    'rw',
+    [db.stations, db.buildings, db.valves, db.measures, db.adjusts, db.executionBatches, db.executionItems],
+    async () => {
+      await Promise.all([
+        db.stations.clear(),
+        db.buildings.clear(),
+        db.valves.clear(),
+        db.measures.clear(),
+        db.adjusts.clear(),
+        db.executionBatches.clear(),
+        db.executionItems.clear()
+      ])
+      const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
+      await db.stations.bulkPut((payload.stations ?? []).map(rev))
+      await db.buildings.bulkPut((payload.buildings ?? []).map(rev))
+      await db.valves.bulkPut((payload.valves ?? []).map(rev))
+      await db.measures.bulkPut((payload.measures ?? []).map(rev))
+      await db.adjusts.bulkPut((payload.adjusts ?? []).map(rev))
+      await db.executionBatches.bulkPut((payload.executionBatches ?? []).map(rev))
+      await db.executionItems.bulkPut((payload.executionItems ?? []).map(rev))
+    }
+  )
 }
 
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', db.stations, db.buildings, db.valves, db.measures, db.adjusts, async () => {
-    await Promise.all([
-      db.stations.clear(),
-      db.buildings.clear(),
-      db.valves.clear(),
-      db.measures.clear(),
-      db.adjusts.clear()
-    ])
-  })
+  await db.transaction(
+    'rw',
+    [db.stations, db.buildings, db.valves, db.measures, db.adjusts, db.executionBatches, db.executionItems],
+    async () => {
+      await Promise.all([
+        db.stations.clear(),
+        db.buildings.clear(),
+        db.valves.clear(),
+        db.measures.clear(),
+        db.adjusts.clear(),
+        db.executionBatches.clear(),
+        db.executionItems.clear()
+      ])
+    }
+  )
 }
 
 export async function resetDatabase(): Promise<void> {
